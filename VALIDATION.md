@@ -2,7 +2,8 @@
 
 - Runtime used: Linux, Python 3.12.14.
 - Installed all pinned dependencies from `requirements.txt` with TLS verification enabled.
-- `python -m unittest discover -s tests -v`: 35 tests passed.
+- `python -m unittest discover -s tests -v`: 36 tests passed.
+- First-launch regression: with Streamlit credentials reported missing, non-headless mode enabled, and no stdin response supplied, the real server reached HTTP health readiness without an email prompt. The project config and Windows launcher disable `server.showEmailPrompt` while retaining automatic browser opening.
 - Coverage includes Wilder's published RSI reference values, CCI mean absolute deviation, neutral flat prices, warm-up, A1/A2/B entries, equality boundaries, duplicate entries, separate per-position +100 state, both exits, adjustment around a split, unconfirmed/future-day filtering, cache integrity, and actionable network errors.
 - Streamlit AppTest exercises demo mode, switching CCI periods, disabling all entries, mocked symbol search and fetch, cache reload, and failed refresh clearing the current analysis.
 - CLI tests exercise mocked collection, cached analysis without network access, CSV settings, and a failing exit status for missing data.
