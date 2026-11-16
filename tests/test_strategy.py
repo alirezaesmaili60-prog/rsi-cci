@@ -59,6 +59,12 @@ class StrategyTests(unittest.TestCase):
         result = signal_states([55, 55], [-5, 5], ("B",))
         self.assertEqual(result.iloc[-1]["action"], "")
 
+    def test_raw_entry_condition_still_visible_when_holding_suppresses_new_buy(self):
+        result = signal_states([55, 55, 55], [-5, 5, 110], ("A1", "A2"))
+        self.assertEqual(result.iloc[1]["action"], "BUY")
+        self.assertEqual(result.iloc[2]["action"], "")
+        self.assertEqual(result.iloc[2]["entry_conditions"], "A2")
+
     def test_config_rejects_ambiguous_period_and_empty_rules(self):
         with self.assertRaises(ValueError):
             StrategyConfig(18)

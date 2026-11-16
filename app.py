@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from rsi_cci.data import DataError, HistoryCache, parse_history, prepare_prices, tehran_today
 from rsi_cci.demo import demo_history
+from rsi_cci.market_ui import render_market
 from rsi_cci.strategy import StrategyConfig, analyze
 from rsi_cci.tsetmc import TsetmcClient
 
@@ -134,7 +135,9 @@ def main():
         st.divider()
         st.caption("CCI۱۴ و CCI۲۰ دو نسخه مستقل راهبرد هستند؛ با تغییر دوره، سابقه فرضی دوباره محاسبه می‌شود.")
 
-    tab_live, tab_cache, tab_demo = st.tabs(["دریافت از TSETMC", "داده ذخیره‌شده", "آزمایش بدون اینترنت"])
+    tab_market, tab_live, tab_cache, tab_demo = st.tabs(["اسکن کل بازار", "دریافت از TSETMC", "داده ذخیره‌شده", "آزمایش بدون اینترنت"])
+    with tab_market:
+        render_market(CACHE, tuple(entries), adjusted, basis, include_today)
     with tab_live:
         with st.form("search_form"):
             query = st.text_input("نام نماد", placeholder="مثلاً فولاد")
@@ -190,7 +193,7 @@ def main():
         except (DataError, ValueError) as exc:
             st.error(str(exc))
     else:
-        st.info("یک نماد را جست‌وجو و دریافت کنید یا با داده آزمایشی شروع کنید.")
+        st.info("برای نمودار و تاریخچه یک سهم، از تب دریافت تک‌سهم یا داده ذخیره‌شده استفاده کنید؛ شناسه نماد در نتایج بازار هم موجود است.")
     with st.expander("قواعد دقیق و محدودیت‌ها"):
         st.markdown("""
         - A1: RSI14 بالای ۵۰ و عبور صعودی CCI از صفر.

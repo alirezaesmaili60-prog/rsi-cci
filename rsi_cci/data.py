@@ -26,6 +26,21 @@ def instrument_code(value: str | int) -> str:
     return value
 
 
+def write_json_atomic(path: Path, document: dict) -> None:
+    """Replace a local document only after its complete JSON has been written."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
+            temp_path = Path(f.name)
+            json.dump(document, f, ensure_ascii=False, allow_nan=False)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+
 def parse_history(payload: dict) -> pd.DataFrame:
     rows = payload.get("closingPriceDaily") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not rows:
@@ -100,16 +115,7 @@ class HistoryCache:
         parse_history(payload)  # Reject invalid responses before replacing good data.
         document = {"version": 1, "code": instrument_code(code), "label": str(label),
                     "fetched_at": datetime.now(timezone.utc).isoformat(), "payload": payload}
-        self.directory.mkdir(parents=True, exist_ok=True)
-        temp_path = None
-        try:
-            with NamedTemporaryFile("w", encoding="utf-8", dir=self.directory, delete=False) as f:
-                temp_path = Path(f.name)
-                json.dump(document, f, ensure_ascii=False, allow_nan=False)
-            os.replace(temp_path, self.path(code))
-        finally:
-            if temp_path and temp_path.exists():
-                temp_path.unlink()
+        write_json_atomic(self.path(code), document)
         return document
 
     def load(self, code: str) -> dict:

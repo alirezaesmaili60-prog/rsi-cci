@@ -43,9 +43,16 @@ def signal_states(rsi_values: Iterable[float], cci_values: Iterable[float],
     entry_index: int | None = None
     for i, (r, c) in enumerate(zip(rsis, ccis)):
         action, reason = "", ""
+        triggers = []
         valid = i > 0 and np.isfinite([rsis[i - 1], ccis[i - 1], r, c]).all()
         if valid:
             prev_r, prev_c = rsis[i - 1], ccis[i - 1]
+            if "A1" in entries and r > 50 and crosses_up(prev_c, c, 0):
+                triggers.append("A1")
+            if "A2" in entries and r > 50 and crosses_up(prev_c, c, 100):
+                triggers.append("A2")
+            if "B" in entries and c > 0 and crosses_up(prev_r, r, 50):
+                triggers.append("B")
             if holding:
                 reached_100 = reached_100 or c > 100
                 if reached_100 and crosses_down(prev_c, c, 100):
@@ -55,19 +62,12 @@ def signal_states(rsi_values: Iterable[float], cci_values: Iterable[float],
                 if action:
                     holding, reached_100, entry_index = False, False, None
             else:
-                triggers = []
-                if "A1" in entries and r > 50 and crosses_up(prev_c, c, 0):
-                    triggers.append("A1")
-                if "A2" in entries and r > 50 and crosses_up(prev_c, c, 100):
-                    triggers.append("A2")
-                if "B" in entries and c > 0 and crosses_up(prev_r, r, 50):
-                    triggers.append("B")
                 if triggers:
                     action, reason = "BUY", "+".join(triggers)
                     holding, reached_100, entry_index = True, c > 100, i
-        rows.append({"action": action, "reason": reason, "holding": holding,
+        rows.append({"action": action, "reason": reason, "entry_conditions": "+".join(triggers), "holding": holding,
                      "reached_100": reached_100, "entry_index": entry_index})
-    return pd.DataFrame(rows, columns=["action", "reason", "holding", "reached_100", "entry_index"])
+    return pd.DataFrame(rows, columns=["action", "reason", "entry_conditions", "holding", "reached_100", "entry_index"])
 
 
 def analyze(prices: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
