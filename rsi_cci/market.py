@@ -13,9 +13,11 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
-from .data import DataError, HistoryCache, parse_history, prepare_prices, tehran_today, write_json_atomic
+from .data import DataError, HistoryCache, parse_history, tehran_today, write_json_atomic
 from .strategy import StrategyConfig, analyze
 from .tsetmc import STOCK_TYPES, Instrument, TsetmcClient
+from .timeframes import Session, TIMEFRAMES, catalog_reference, label_timestamp
+from .workflow import prepare_timeframe
 
 
 @dataclass(frozen=True)
@@ -31,8 +33,18 @@ class ScanOptions:
     cache_minutes: int = 60
     delay_seconds: float = 0.4
     failure_limit: int = 5
+    timeframes: tuple[str, ...] = ("daily",)
+    intraday_days: int = 30
+    session_start: str = "09:00"
+    session_end: str = "12:30"
+    include_short_bar: bool = True
 
     def __post_init__(self):
+        if not self.timeframes or len(set(self.timeframes)) != len(self.timeframes) or not set(self.timeframes) <= set(TIMEFRAMES):
+            raise ValueError("حداقل یک تایم‌فریم معتبر و بدون تکرار انتخاب کنید.")
+        if not isinstance(self.intraday_days, int) or self.intraday_days < 0:
+            raise ValueError("تعداد روز درون‌روزی باید صفر یا بیشتر باشد.")
+        Session(self.session_start, self.session_end, self.include_short_bar)
         if not self.periods or len(set(self.periods)) != len(self.periods):
             raise ValueError("حداقل یک دوره CCI انتخاب کنید؛ دوره تکراری مجاز نیست.")
         for period in self.periods:
@@ -45,7 +57,7 @@ class ScanOptions:
             raise ValueError("تنظیمات دریافت معتبر نیست.")
 
 
-def summarize(result: pd.DataFrame, lookback: int) -> dict:
+def summarize(result: pd.DataFrame, lookback: int, timeframe: str = "daily") -> dict:
     """Keep last-bar state separate from recent threshold events."""
     last, recent = result.iloc[-1], result.tail(lookback)
     entry = recent.loc[recent["entry_conditions"].ne("")]
@@ -53,16 +65,19 @@ def summarize(result: pd.DataFrame, lookback: int) -> dict:
     exits = recent.loc[recent["action"].eq("EXIT")]
 
     def event_date(events):
-        return events.iloc[-1]["date"].date().isoformat() if not events.empty else ""
+        return label_timestamp(events.iloc[-1]["date"], timeframe) if not events.empty else ""
 
-    return {"date": last["date"].date().isoformat(), "close": float(last["close"]),
+    return {"date": label_timestamp(last["date"], timeframe), "close": float(last["close"]),
             "rsi": float(last["rsi"]), "cci": float(last["cci"]),
             "entry_signal_date": event_date(entry),
             "entry_conditions": str(entry.iloc[-1]["entry_conditions"]) if not entry.empty else "",
             "buy_signal_date": event_date(buy), "exit_signal_date": event_date(exits),
             "exit_reason": str(exits.iloc[-1]["reason"]) if not exits.empty else "",
             "action": str(last["action"]), "holding": bool(last["holding"]),
-            "reached_100": bool(last["reached_100"])}
+            "reached_100": bool(last["reached_100"]),
+            "bar_minutes": int(last["bar_minutes"]) if "bar_minutes" in last else None,
+            "short_session_bar": bool(last.get("short_session_bar", False)),
+            "last_trade_at": str(last.get("last_trade_at", last.get("last_trade_date", "")))}
 
 
 def report_frame(snapshot: dict) -> pd.DataFrame:
@@ -70,20 +85,29 @@ def report_frame(snapshot: dict) -> pd.DataFrame:
     if frame.empty:
         return frame
     options = snapshot.get("options", {})
+    if "timeframe" not in frame:
+        frame["timeframe"] = "daily"
     for key in ("adjusted", "close_basis", "include_today", "lookback", "scope", "mode"):
         frame[key] = options.get(key)
     frame["entry_rules"] = ",".join(options.get("entries", []))
     frame["scan_started_at_utc"] = snapshot.get("started_at", "")
-    frame["reference_date"] = snapshot.get("reference_date", "")
+    frame["reference_date"] = frame["timeframe"].map(snapshot.get("reference_dates", {"daily": snapshot.get("reference_date", "")})).fillna("")
+    frame["requested_close_basis"] = options.get("close_basis", "final")
+    frame["close_basis"] = frame["timeframe"].map(lambda tf: "close" if tf == "2h" else options.get("close_basis", "final"))
+    for key, default in {"intraday_days": 30, "session_start": "09:00", "session_end": "12:30", "include_short_bar": True}.items():
+        frame[key] = options.get(key, default)
+    frame["timezone"] = "Asia/Tehran"
     frame["run_state"] = snapshot.get("state", "")
     return frame
 
 
-def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = False) -> pd.DataFrame:
+def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = False, timeframe: str | None = None) -> pd.DataFrame:
     frame = report_frame(snapshot)
     if frame.empty:
         return frame
     mask = frame["status"].eq("OK")
+    if timeframe:
+        mask &= frame["timeframe"].eq(timeframe)
     if not include_stale:
         mask &= ~frame["stale"]
     if kind == "entry":
@@ -96,7 +120,7 @@ def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = Fa
         mask &= frame["holding"]
     elif kind != "all":
         raise ValueError("Unknown result filter")
-    return frame.loc[mask].sort_values(["symbol", "cci_period"]).reset_index(drop=True)
+    return frame.loc[mask].sort_values(["symbol", "timeframe", "cci_period"]).reset_index(drop=True)
 
 
 class MarketScanner:
@@ -128,16 +152,21 @@ class MarketScanner:
         with self._lock:
             result = copy.deepcopy(self._state)
             result["running"] = self._running
-        dates = [row["date"] for row in result.get("rows", []) if row["status"] == "OK"]
-        today = result.get("today", "")
+        today = date.fromisoformat(result.get("today", tehran_today().isoformat()))
         include_today = result.get("options", {}).get("include_today", False)
-        dates += [row["catalog_last_date"] for row in result.get("rows", [])
-                  if row.get("catalog_last_date") and (row["catalog_last_date"] < today or
-                                                       include_today and row["catalog_last_date"] == today)]
-        reference = max(dates, default="")
-        result["reference_date"] = reference
+        options = result.get("options", {})
+        session = Session(options.get("session_start", "09:00"), options.get("session_end", "12:30"), options.get("include_short_bar", True))
+        references = {}
         for row in result.get("rows", []):
-            row["stale"] = bool(row["status"] == "OK" and row["date"] < reference)
+            tf = row.setdefault("timeframe", "daily")
+            advertised = catalog_reference(row.get("catalog_last_date", ""), tf, today=today,
+                                             include_today=include_today, session=session)
+            observed = row["date"] if row["status"] == "OK" else ""
+            references[tf] = max(references.get(tf, ""), advertised, observed)
+        result["reference_dates"] = references
+        result["reference_date"] = references.get("daily", next(iter(references.values()), ""))
+        for row in result.get("rows", []):
+            row["stale"] = bool(row["status"] == "OK" and row["date"] < references.get(row["timeframe"], ""))
         return result
 
     def _begin(self, options: ScanOptions):
@@ -151,6 +180,7 @@ class MarketScanner:
                            "today": tehran_today().isoformat(), "options": asdict(options),
                            "universe_total": 0, "total": 0, "excluded": 0, "unclassified": 0,
                            "processed": 0, "downloaded": 0, "cached": 0, "failed": 0,
+                           "intraday_downloaded": 0, "intraday_cached": 0, "intraday_warning": "",
                            "current": "", "error": "", "save_warning": "", "rows": []}
 
     def start(self, options: ScanOptions):
@@ -229,33 +259,38 @@ class MarketScanner:
         return self.cache.save(item.code, item.symbol, payload), "download"
 
     @staticmethod
-    def _empty_row(item: Instrument, period: int) -> dict:
+    def _empty_row(item: Instrument, period: int, timeframe: str = "daily") -> dict:
         catalog_date = datetime.strptime(str(item.last_date), "%Y%m%d").date().isoformat() if item.last_date else ""
         return {"code": item.code, "symbol": item.symbol, "name": item.name, "market": item.market,
                 "security_type": item.security_type, "classification_source": item.classification_source,
-                "cci_period": period, "status": "PENDING", "error": "",
+                "cci_period": period, "timeframe": timeframe, "status": "PENDING", "error": "",
                 "date": "", "catalog_last_date": catalog_date, "close": None, "rsi": None, "cci": None, "entry_conditions": "",
                 "entry_signal_date": "", "buy_signal_date": "", "exit_signal_date": "", "exit_reason": "",
-                "action": "", "holding": False, "reached_100": False, "source": "", "fetched_at": ""}
+                "action": "", "holding": False, "reached_100": False, "source": "", "fetched_at": "",
+                "intraday_source": "", "bar_minutes": None, "short_session_bar": False}
 
     def _work(self, options: ScanOptions, progress=None):
         try:
             with self.client_factory() as client:
                 items = self._universe(client, options)
+                frames = [tf for tf in TIMEFRAMES if tf in options.timeframes]
+                width = len(options.periods) * len(frames)
+                session = Session(options.session_start, options.session_end, options.include_short_bar)
                 with self._lock:
                     self._state["state"] = "running"
-                    self._state["rows"] = [self._empty_row(item, period) for item in items for period in options.periods]
+                    self._state["rows"] = [self._empty_row(item, period, tf) for item in items for tf in frames for period in options.periods]
                     today = date.fromisoformat(self._state["today"])
                 self._persist()
                 if progress:
                     progress(self.snapshot())
                 consecutive_failures = 0
+                intraday_failures, intraday_paused = 0, False
                 for index, item in enumerate(items):
                     if self._cancel.is_set():
                         break
                     with self._lock:
                         self._state["current"] = item.symbol
-                    rows = [self._empty_row(item, period) for period in options.periods]
+                    rows = [self._empty_row(item, period, tf) for tf in frames for period in options.periods]
                     fetch_failed = False
                     try:
                         document, source = self._document(client, item, options)
@@ -272,21 +307,52 @@ class MarketScanner:
                     if not fetch_failed:
                         for row in rows:
                             row.update(source=source, fetched_at=document["fetched_at"])
-                        try:
-                            prices = prepare_prices(parse_history(document["payload"]), adjusted=options.adjusted,
-                                                    close_basis=options.close_basis, include_today=options.include_today,
-                                                    today=today)
-                            for row in rows:
-                                if len(prices) < max(14, row["cci_period"]) + 2:
-                                    row.update(status="INSUFFICIENT", error="سابقه برای این دوره کافی نیست.")
-                                    continue
-                                result = analyze(prices, StrategyConfig(row["cci_period"], options.entries))
-                                row.update(summarize(result, options.lookback), status="OK")
-                        except (DataError, ValueError, KeyError) as exc:
-                            for row in rows:
-                                row.update(status="ANALYSIS_ERROR", error=str(exc))
+                        raw = parse_history(document["payload"])
+                        for tf in frames:
+                            selected_rows = [row for row in rows if row["timeframe"] == tf]
+                            intraday_sources = []
+
+                            def minute_progress(day, origin, number, total_days):
+                                intraday_sources.append(origin)
+                                with self._lock:
+                                    key = "intraday_downloaded" if origin == "download" else "intraday_cached"
+                                    self._state[key] += 1
+                                    self._state["current"] = f"{item.symbol} | {day} | {number}/{total_days} روز"
+
+                            try:
+                                prices = prepare_timeframe(raw, tf, adjusted=options.adjusted, close_basis=options.close_basis,
+                                                           include_today=options.include_today, today=today, cache=self.cache,
+                                                           code=item.code, client=client, mode="offline" if intraday_paused and tf == "2h" else options.mode,
+                                                           intraday_days=options.intraday_days, session=session, cancel=self._cancel,
+                                                           delay_seconds=options.delay_seconds, progress=minute_progress)
+                                if tf == "2h":
+                                    intraday_failures = 0
+                                for row in selected_rows:
+                                    row["intraday_source"] = ("download" if "download" in intraday_sources else options.mode if options.mode == "offline" else "cache") if tf == "2h" else ""
+                                    if len(prices) < max(14, row["cci_period"]) + 2:
+                                        row.update(status="INSUFFICIENT", error="تعداد کندل کامل برای این دوره و تایم‌فریم کافی نیست.")
+                                        continue
+                                    result = analyze(prices, StrategyConfig(row["cci_period"], options.entries))
+                                    row.update(summarize(result, options.lookback, tf), status="OK")
+                            except InterruptedError:
+                                self._cancel.set()
+                            except (DataError, ValueError, KeyError, OSError) as exc:
+                                for row in selected_rows:
+                                    row.update(status="INTRADAY_ERROR" if tf == "2h" else "ANALYSIS_ERROR", error=str(exc))
+                                if tf == "2h":
+                                    intraday_failures += 1
+                                    if options.mode != "offline" and intraday_failures >= options.failure_limit:
+                                        intraday_paused = True
+                                        with self._lock:
+                                            self._state["intraday_warning"] = "دریافت درون‌روزی پس از خطاهای متوالی متوقف شد؛ ادامه اسکن ۲ساعته فقط با فایل‌های موجود است. سایر تایم‌فریم‌ها ادامه دارند."
+                            with self._lock:
+                                self._state["rows"][index * width:index * width + len(rows)] = copy.deepcopy(rows)
+                            if self._cancel.is_set():
+                                break
+                    if self._cancel.is_set() and any(row["status"] == "PENDING" for row in rows):
+                        break
                     with self._lock:
-                        start = index * len(options.periods)
+                        start = index * width
                         self._state["rows"][start:start + len(rows)] = rows
                         self._state["processed"] += 1
                         self._state["failed"] += int(any(row["status"] != "OK" for row in rows))

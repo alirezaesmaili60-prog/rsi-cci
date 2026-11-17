@@ -56,6 +56,82 @@ class UniverseTests(unittest.TestCase):
 
 
 class MarketScannerTests(unittest.TestCase):
+    def test_all_three_timeframes_have_independent_references_and_resume(self):
+        from tests.test_timeframes import trades_for_day
+        payload = signal_history()
+        client = fake_client([market_item("1")], {"1": payload})
+        client.trades.side_effect = lambda code, day: trades_for_day(payload, day)
+        scanner = self.scanner(client)
+        options = ScanOptions(timeframes=("daily", "weekly", "2h"), intraday_days=12, delay_seconds=0)
+        snapshot = scanner.run(options)
+        self.assertEqual(len(snapshot["rows"]), 6)
+        self.assertEqual({row["status"] for row in snapshot["rows"]}, {"OK"})
+        self.assertEqual(set(snapshot["reference_dates"]), {"daily", "weekly", "2h"})
+        self.assertTrue(all(not row["stale"] for row in snapshot["rows"]))
+        self.assertEqual(snapshot["intraday_downloaded"], 12)
+        self.assertEqual(len(filter_results(snapshot, "all", timeframe="weekly")), 2)
+        report = report_frame(snapshot)
+        self.assertEqual(set(report.loc[report.timeframe.eq("2h"), "close_basis"]), {"close"})
+        self.assertEqual(set(report.loc[report.timeframe.eq("daily"), "close_basis"]), {"final"})
+        self.assertTrue(report.loc[report.timeframe.eq("2h"), "short_session_bar"].all())
+        client.history.reset_mock()
+        client.trades.reset_mock()
+        resumed = scanner.run(options)
+        self.assertEqual(resumed["intraday_cached"], 12)
+        self.assertEqual(resumed["intraday_downloaded"], 0)
+        client.history.assert_not_called()
+        client.trades.assert_not_called()
+
+    def test_missing_intraday_preserves_daily_weekly_and_cache_for_completed_days(self):
+        from tests.test_timeframes import trades_for_day
+        payload = signal_history()
+        client = fake_client([market_item("1")], {"1": payload})
+
+        def fail_second_day(code, day):
+            if client.trades.call_count == 2:
+                raise DataError("historical intraday unavailable")
+            return trades_for_day(payload, day)
+
+        client.trades.side_effect = fail_second_day
+        snapshot = self.scanner(client).run(ScanOptions(timeframes=("daily", "weekly", "2h"), intraday_days=12, delay_seconds=0))
+        self.assertEqual({row["status"] for row in snapshot["rows"] if row["timeframe"] != "2h"}, {"OK"})
+        self.assertEqual({row["status"] for row in snapshot["rows"] if row["timeframe"] == "2h"}, {"INTRADAY_ERROR"})
+        self.assertEqual(len(list((self.cache.directory / "intraday/1").glob("*.json"))), 1)
+
+    def test_intraday_failure_breaker_keeps_other_timeframes_running(self):
+        client = fake_client([market_item("1"), market_item("2"), market_item("3")])
+        client.trades.side_effect = DataError("intraday API unavailable")
+        snapshot = self.scanner(client).run(ScanOptions(timeframes=("daily", "weekly", "2h"), intraday_days=12,
+                                                         delay_seconds=0, failure_limit=2))
+        self.assertEqual(snapshot["state"], "done")
+        self.assertEqual(snapshot["processed"], 3)
+        self.assertEqual(client.trades.call_count, 2)
+        self.assertTrue(snapshot["intraday_warning"])
+        self.assertTrue(all(row["status"] == "OK" for row in snapshot["rows"] if row["timeframe"] != "2h"))
+
+    def test_cancelling_intraday_keeps_other_timeframes_and_resumes_saved_days(self):
+        from tests.test_timeframes import trades_for_day
+        payload = signal_history()
+        client = fake_client([market_item("1")], {"1": payload})
+        scanner = self.scanner(client)
+
+        def cancel_second_day(code, day):
+            if client.trades.call_count == 2:
+                scanner.cancel()
+            return trades_for_day(payload, day)
+
+        client.trades.side_effect = cancel_second_day
+        options = ScanOptions(timeframes=("daily", "weekly", "2h"), intraday_days=12, delay_seconds=0)
+        stopped = scanner.run(options)
+        self.assertEqual(stopped["state"], "cancelled")
+        self.assertTrue(all(row["status"] == "OK" for row in stopped["rows"] if row["timeframe"] != "2h"))
+        self.assertEqual(len(list((self.cache.directory / "intraday/1").glob("*.json"))), 2)
+        client.trades.side_effect = lambda code, day: trades_for_day(payload, day)
+        resumed = scanner.run(options)
+        self.assertEqual(resumed["state"], "done")
+        self.assertEqual(resumed["intraday_cached"], 2)
+        self.assertEqual(resumed["intraday_downloaded"], 10)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -15,6 +15,16 @@ from rsi_cci.tsetmc import TsetmcClient
 
 
 class ClientTests(unittest.TestCase):
+    def test_intraday_uses_real_trade_endpoint_with_validated_date(self):
+        session = Mock()
+        session.headers = {}
+        session.get.return_value.json.return_value = {"tradeHistory": []}
+        with TsetmcClient(session) as client:
+            client.trades("123", 20261116)
+            self.assertTrue(session.get.call_args.args[0].endswith("Trade/GetTradeHistory/123/20261116/false"))
+            with self.assertRaises(DataError):
+                client.trades("123", 20260230)
+
     def test_search_unicode_encoding_and_latest_exact_match(self):
         session = Mock()
         session.headers = {}

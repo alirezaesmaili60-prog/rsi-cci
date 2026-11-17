@@ -12,6 +12,43 @@ from rsi_cci.demo import demo_history
 
 
 class CliTests(unittest.TestCase):
+    def test_weekly_analysis_uses_cached_daily_data(self):
+        from rsi_cci.data import HistoryCache
+        from tests.market_fixtures import signal_history
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()), \
+             patch("sys.argv", ["cli", "analyze", "123", "--data-dir", temp, "--timeframe", "weekly"]):
+            HistoryCache(Path(temp)).save("123", "نماد", signal_history())
+            self.assertEqual(main(), 0)
+            frame = pd.read_csv(Path(temp) / "123_cci14_weekly.csv")
+            self.assertEqual(set(frame.timeframe), {"weekly"})
+            self.assertTrue(frame.rsi.iloc[:14].isna().all())
+            self.assertGreater(frame.rsi.notna().sum(), 0)
+
+    def test_two_hour_fetch_and_offline_analysis(self):
+        from rsi_cci.intraday import collect_minutes
+        from tests.market_fixtures import signal_history
+        from tests.test_timeframes import trades_for_day
+        payload = signal_history()
+
+        def fast_collect(*args, **kwargs):
+            kwargs["delay_seconds"] = 0
+            return collect_minutes(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()), \
+             patch("rsi_cci.tsetmc.TsetmcClient.history", return_value=payload), \
+             patch("rsi_cci.tsetmc.TsetmcClient.trades", side_effect=lambda code, day: trades_for_day(payload, day)) as trades, \
+             patch("rsi_cci.workflow.collect_minutes", side_effect=fast_collect):
+            with patch("sys.argv", ["cli", "fetch", "123", "--data-dir", temp, "--timeframe", "2h", "--intraday-days", "12"]):
+                self.assertEqual(main(), 0)
+            frame = pd.read_csv(Path(temp) / "123_cci14_2h.csv")
+            self.assertEqual(len(frame), 24)
+            self.assertEqual(set(frame.close_basis), {"close"})
+            self.assertTrue(frame.date.str.contains("\\+03:30").all())
+            trades.reset_mock()
+            with patch("sys.argv", ["cli", "analyze", "123", "--data-dir", temp, "--timeframe", "2h", "--intraday-days", "12"]):
+                self.assertEqual(main(), 0)
+            trades.assert_not_called()
+
     def test_market_scan_and_offline_rescan_export_coverage_and_matches(self):
         from tests.market_fixtures import market_item, signal_history
 

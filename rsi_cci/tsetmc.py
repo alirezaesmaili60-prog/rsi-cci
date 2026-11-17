@@ -88,6 +88,12 @@ class TsetmcClient:
         parse_history(payload)
         return payload
 
+    def trades(self, code: str, day: int) -> dict:
+        from .intraday import trade_date
+        code = instrument_code(code)
+        trade_date(day)
+        return self._get(f"Trade/GetTradeHistory/{code}/{day}/false")
+
     def market_universe(self) -> list[Instrument]:
         # Request all paper types and non-traded instruments, not just today's
         # trades. Filter ordinary shares locally by the reported yVal code.

@@ -6,6 +6,7 @@ import streamlit as st
 
 from .data import DataError, HistoryCache
 from .market import MarketScanner, ScanOptions, filter_results, report_frame
+from .timeframes import TIMEFRAMES, Session
 
 
 @st.cache_resource
@@ -17,24 +18,25 @@ STATE_LABELS = {"listing": "دریافت فهرست بازار", "running": "د�
                 "done": "پایان پردازش", "cancelled": "توقف به درخواست شما",
                 "failed": "توقف با خطا", "interrupted": "اجرای قبلی ناتمام است"}
 STATUS_LABELS = {"OK": "موفق", "PENDING": "بررسی‌نشده", "FETCH_ERROR": "خطای دریافت",
-                 "ANALYSIS_ERROR": "خطای تحلیل", "INSUFFICIENT": "سابقه ناکافی"}
+                 "ANALYSIS_ERROR": "خطای تحلیل", "INTRADAY_ERROR": "خطای داده درون‌روزی", "INSUFFICIENT": "سابقه ناکافی"}
 HEADERS = {"symbol": "نماد", "code": "شناسه", "name": "نام", "market": "بازار",
-           "cci_period": "دوره CCI", "date": "آخرین کندل", "close": "قیمت مبنا",
+           "cci_period": "دوره CCI", "timeframe": "تایم‌فریم", "date": "آخرین کندل", "close": "قیمت مبنا",
            "rsi": "RSI14", "cci": "CCI", "entry_conditions": "شرط ورود",
            "entry_signal_date": "تاریخ شرط ورود", "buy_signal_date": "تاریخ ورود مجاز راهبرد",
            "exit_signal_date": "تاریخ خروج", "exit_reason": "علت خروج",
            "holding": "داخل معامله فرضی", "stale": "تاریخ قدیمی‌تر از بازار",
            "status": "وضعیت", "error": "توضیح خطا", "source": "منبع دریافت",
-           "fetched_at": "زمان دریافت UTC"}
+           "fetched_at": "زمان دریافت UTC", "bar_minutes": "مدت کندل (دقیقه)", "short_session_bar": "کندل کوتاه پایان جلسه"}
 
 
 def render_market(cache: HistoryCache, entries: tuple[str, ...], adjusted: bool,
-                  basis: str, include_today: bool):
+                  basis: str, include_today: bool, *, intraday_days=30, session=None):
+    session = session or Session()
     scanner = market_scanner(str(cache.directory.resolve()))
     st.subheader("دریافت و اسکن کل بازار")
     st.write("با یک شروع، فهرست نمادها و تمام سابقه روزانه موجود هر نماد دریافت، ذخیره و بررسی می‌شود.")
     st.caption("محدوده پیش‌فرض: سهام بورس، فرابورس و پایه در فهرست دیده‌بان TSETMC؛ "
-               "داده شامل سابقه روزانه است. نمادهای حذف‌شده از فهرست و داده ریزمعاملات پوشش داده نمی‌شوند.")
+               "روزانه و هفتگی از سابقه روزانه، و ۲ساعته از ریزمعاملات ساخته می‌شوند. نمادهای حذف‌شده از فهرست پوشش داده نمی‌شوند.")
     scopes = {"تمام سهام بورس، فرابورس و پایه": "stocks", "تمام اوراق موجود در فهرست (شامل صندوق و حق تقدم)": "all"}
     modes = {"دریافت و ادامه با استفاده از فایل تازه": "resume", "به‌روزرسانی اجباری همه نمادها": "refresh",
              "تحلیل آفلاین فایل‌های قبلی": "offline"}
@@ -43,16 +45,22 @@ def render_market(cache: HistoryCache, entries: tuple[str, ...], adjusted: bool,
         scope = left.selectbox("محدوده بازار", list(scopes))
         mode = right.selectbox("روش جمع‌آوری بازار", list(modes))
         periods = left.multiselect("دوره‌های CCI برای اسکن بازار", [14, 20], default=[14, 20])
+        timeframes = right.multiselect("تایم‌فریم‌های اسکن بازار", list(TIMEFRAMES), default=["daily"], format_func=TIMEFRAMES.get)
         lookback = right.number_input("سیگنال در چند کندل آخر بررسی شود؟", 1, 10, 1)
         cache_minutes = left.number_input("حداکثر عمر فایل برای ادامه دریافت (دقیقه)", 1, 1440, 60)
         st.caption("روش‌های ورود، مبنای قیمت، تعدیل و تأیید پایان جلسه از نوار کناری گرفته می‌شوند. "
                    "تنظیمات هر اسکن تا پایان همان اجرا ثابت می‌مانند.")
+        st.caption(f"۲ساعته: {intraday_days or 'همه'} روز معاملاتی؛ جلسه {session.start} تا {session.end}. "
+                   "دریافت اول درون‌روزی کل بازار ممکن است بسیار طولانی باشد؛ فایل هر روز برای ادامه حفظ می‌شود. "
+                   "مبنای ۲ساعته همیشه آخرین معامله است.")
         submitted = st.form_submit_button("شروع دریافت و اسکن بازار", type="primary")
     if submitted:
         try:
             options = ScanOptions(periods=tuple(periods), entries=entries, scope=scopes[scope], mode=modes[mode],
                                   adjusted=adjusted, close_basis=basis, include_today=include_today,
-                                  lookback=int(lookback), cache_minutes=int(cache_minutes))
+                                  lookback=int(lookback), cache_minutes=int(cache_minutes), timeframes=tuple(timeframes),
+                                  intraday_days=intraday_days, session_start=session.start, session_end=session.end,
+                                  include_short_bar=session.include_short)
             scanner.start(options)
         except (DataError, ValueError) as exc:
             st.error(str(exc))
@@ -90,6 +98,14 @@ def scan_progress(scanner: MarketScanner, polling: bool = False):
         st.error(snapshot["error"])
     if snapshot.get("save_warning"):
         st.warning(snapshot["save_warning"])
+    if snapshot.get("intraday_warning"):
+        st.warning(snapshot["intraday_warning"])
+    st.caption("تایم‌فریم‌های این اسکن: " + "، ".join(TIMEFRAMES.get(tf, tf) for tf in options.get("timeframes", ["daily"]))
+               + f" | روز درون‌روزی جدید: {snapshot.get('intraday_downloaded', 0)} | فایل روز درون‌روزی: {snapshot.get('intraday_cached', 0)}")
+    if "2h" in options.get("timeframes", []):
+        st.caption(f"تنظیمات ثبت‌شده این گزارش ۲ساعته: {options.get('intraday_days', 30) or 'همه'} روز؛ "
+                   f"جلسه {options.get('session_start', '09:00')}–{options.get('session_end', '12:30')}؛ "
+                   + ("با کندل کوتاه پایان جلسه" if options.get("include_short_bar", True) else "فقط کندل‌های کامل ۱۲۰دقیقه‌ای"))
     st.caption(f"فهرست منبع: {snapshot['universe_total']} نماد | انتخاب‌شده: {total} | "
                f"خارج از محدوده: {snapshot['excluded']} | دانلود جدید: {snapshot['downloaded']} | "
                f"استفاده از فایل: {snapshot['cached']}")
@@ -102,7 +118,8 @@ def scan_progress(scanner: MarketScanner, polling: bool = False):
     frame = report_frame(snapshot)
     if frame.empty:
         return
-    st.caption("تاریخ مرجع از داده‌های موفق و تاریخ کامل‌شده فهرست همین اسکن: " + (snapshot["reference_date"] or "هنوز مشخص نیست")
+    references = snapshot.get("reference_dates", {"daily": snapshot.get("reference_date", "")})
+    st.caption("تاریخ مرجع مستقل هر تایم‌فریم: " + " | ".join(TIMEFRAMES.get(tf, tf) + ": " + (stamp or "نامشخص") for tf, stamp in references.items())
                + ". سیگنال‌های قدیمی‌تر به‌صورت پیش‌فرض از نتایج کنار گذاشته می‌شوند.")
     stale_count = frame.loc[frame["status"].eq("OK") & frame["stale"], "code"].nunique()
     if stale_count:
@@ -110,26 +127,31 @@ def scan_progress(scanner: MarketScanner, polling: bool = False):
     kinds = {"شرط ورود تازه برقرار است": "entry", "ورود مجاز طبق سابقه راهبرد": "buy",
              "خروج تازه": "exit", "داخل معامله فرضی": "holding", "تمام تحلیل‌های موفق": "all"}
     kind = st.selectbox("نوع نتیجه بازار", list(kinds), key="market_result_kind")
+    frame_choices = ["all"] + list(options.get("timeframes", ["daily"]))
+    selected_frame = st.selectbox("نمایش تایم‌فریم نتیجه", frame_choices,
+                                  format_func=lambda tf: "همه تایم‌فریم‌ها" if tf == "all" else TIMEFRAMES[tf], key="market_result_timeframe")
     include_stale = st.checkbox("نتایج با تاریخ قدیمی‌تر از بازار هم نمایش داده شوند", key="market_include_stale")
-    matches = filter_results(snapshot, kinds[kind], include_stale)
+    matches = filter_results(snapshot, kinds[kind], include_stale, None if selected_frame == "all" else selected_frame)
     cols = st.columns(3)
     cols[0].metric("نماد پردازش‌شده", str(processed))
     cols[1].metric("نماد دارای خطا یا سابقه ناکافی", str(snapshot["failed"]))
     cols[2].metric("نماد در نتیجه انتخابی", str(matches["code"].nunique()))
     st.caption("«شرط ورود» عبور اندیکاتورها را مستقل از وضعیت قبلی نشان می‌دهد؛ "
                "«ورود مجاز» فقط ورودهای مجاز موتور راهبرد است. دو دوره CCI مستقل‌اند و هرکدام یک ردیف دارند.")
-    columns = ["symbol", "code", "market", "cci_period", "date", "rsi", "cci", "entry_conditions",
+    columns = ["symbol", "code", "market", "timeframe", "cci_period", "date", "rsi", "cci", "entry_conditions",
                "entry_signal_date", "buy_signal_date", "exit_signal_date", "exit_reason", "holding", "stale"]
     if matches.empty:
         st.info("در داده‌های موفق فعلی، نمادی با این فیلتر پیدا نشد.")
     else:
-        st.dataframe(matches[columns].round({"rsi": 2, "cci": 2}).rename(columns=HEADERS), width="stretch", hide_index=True)
+        display = matches[columns + [c for c in ("bar_minutes", "short_session_bar") if c in matches]].copy()
+        display["timeframe"] = display["timeframe"].map(TIMEFRAMES)
+        st.dataframe(display.round({"rsi": 2, "cci": 2}).rename(columns=HEADERS), width="stretch", hide_index=True)
     st.download_button("دانلود نتایج انتخابی بازار (CSV)", matches.to_csv(index=False).encode("utf-8-sig"),
-                       "market_matches.csv", "text/csv", key="market_matches_download")
+                       "market_matches.csv", "text/csv", key="market_matches_download", on_click="ignore")
     st.download_button("دانلود گزارش کامل پوشش و خطاها (CSV)", frame.to_csv(index=False).encode("utf-8-sig"),
-                       "market_coverage.csv", "text/csv", key="market_coverage_download")
+                       "market_coverage.csv", "text/csv", key="market_coverage_download", on_click="ignore")
     with st.expander("پوشش تمام نمادها و جزئیات خطاها"):
-        coverage = frame[["symbol", "code", "cci_period", "status", "date", "source", "fetched_at", "error"]].copy()
+        coverage = frame[["symbol", "code", "timeframe", "cci_period", "status", "date", "source", "fetched_at", "error"]].copy()
         coverage["status"] = coverage["status"].map(STATUS_LABELS)
         st.dataframe(coverage.rename(columns=HEADERS), width="stretch", hide_index=True)
     st.caption("اطلاعات خام هر نماد پس از دریافت روی دیسک ذخیره می‌شود؛ "

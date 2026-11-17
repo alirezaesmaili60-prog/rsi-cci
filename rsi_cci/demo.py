@@ -23,3 +23,19 @@ def demo_history() -> dict:
                      "priceYesterday": yesterday, "qTotTran5J": int(300000 + i * 170),
                      "zTotTran": 200 + i})
     return {"closingPriceDaily": rows[::-1]}
+
+
+def demo_two_hour(daily, session, days=30):
+    """Explicitly synthetic minute data for offline UI demonstrations only."""
+    from .timeframes import two_hour_prices
+    frames = []
+    selected = daily if days == 0 else daily.tail(days)
+    for _, row in selected.iterrows():
+        opening, closing = session.bounds(row["date"].date())
+        times = pd.date_range(opening, closing, freq="min", inclusive="left")
+        price = float(row["close"]) / float(row["adjustment_factor"]) * (1 + .003 * np.sin(np.arange(len(times)) / 17))
+        frame = pd.DataFrame({"date": times, "open": price, "high": price, "low": price, "close": price,
+                              "volume": 100, "value": price * 100, "trades": 1,
+                              "first_trade_at": times, "last_trade_at": times})
+        frames.append(frame)
+    return two_hour_prices(pd.concat(frames, ignore_index=True), daily, session)

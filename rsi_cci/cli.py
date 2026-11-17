@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import DataError, HistoryCache, parse_history, prepare_prices
+from .data import DataError, HistoryCache, parse_history
 from .market import MarketScanner, ScanOptions, filter_results, report_frame
 from .strategy import StrategyConfig, analyze
 from .tsetmc import TsetmcClient
+from .timeframes import Session, TIMEFRAMES
+from .workflow import prepare_timeframe
 
 
 def main() -> int:
@@ -28,6 +30,12 @@ def main() -> int:
     parser.add_argument("--refresh", action="store_true", help="Force refresh of all histories in scan")
     parser.add_argument("--lookback", type=int, default=1, help="Scan signals in last N bars (1..10)")
     parser.add_argument("--cache-minutes", type=int, default=60)
+    parser.add_argument("--timeframe", choices=list(TIMEFRAMES), default="daily", help="Single-symbol or default scan timeframe")
+    parser.add_argument("--timeframes", nargs="+", choices=list(TIMEFRAMES), help="Multiple scan timeframes")
+    parser.add_argument("--intraday-days", type=int, default=30, help="Trading days of trades for 2h; 0 means all available days")
+    parser.add_argument("--session-start", default="09:00")
+    parser.add_argument("--session-end", default="12:30")
+    parser.add_argument("--full-bars-only", action="store_true", help="Exclude the shortened final session candle")
     args = parser.parse_args()
     if args.action != "scan" and not args.value:
         parser.error("search/fetch/analyze require a symbol or instrument code")
@@ -35,11 +43,16 @@ def main() -> int:
         parser.error("--offline and --refresh cannot be combined")
     cache = HistoryCache(args.data_dir)
     try:
+        session = Session(args.session_start, args.session_end, not args.full_bars_only)
+        if args.intraday_days < 0:
+            raise DataError("--intraday-days must be zero or positive")
         if args.action == "scan":
             options = ScanOptions(periods=(14, 20) if args.both_cci else (args.cci,), scope=args.scope,
                                   mode="offline" if args.offline else "refresh" if args.refresh else "resume",
                                   adjusted=not args.raw, close_basis="close" if args.last_trade else "final",
-                                  lookback=args.lookback, cache_minutes=args.cache_minutes)
+                                  lookback=args.lookback, cache_minutes=args.cache_minutes,
+                                  timeframes=tuple(args.timeframes or [args.timeframe]), intraday_days=args.intraday_days,
+                                  session_start=session.start, session_end=session.end, include_short_bar=session.include_short)
             print("Collecting market universe and daily histories...", flush=True)
 
             def progress(snapshot):
@@ -77,23 +90,36 @@ def main() -> int:
         if args.action == "fetch":
             with TsetmcClient() as client:
                 document = cache.save(args.value, args.value, client.history(args.value))
+                if args.timeframe == "2h":
+                    prepare_timeframe(parse_history(document["payload"]), "2h", adjusted=not args.raw,
+                                      close_basis="close" if args.last_trade else "final", cache=cache, code=args.value,
+                                      client=client, mode="refresh" if args.refresh else "resume", session=session,
+                                      intraday_days=args.intraday_days,
+                                      progress=lambda day, source, number, total: print(f"Intraday {day}: {number}/{total} ({source})", flush=True))
             print(f"Saved {cache.path(args.value)} at {document['fetched_at']}")
         else:
             document = cache.load(args.value)
-        prices = prepare_prices(parse_history(document["payload"]), adjusted=not args.raw,
-                                close_basis="close" if args.last_trade else "final")
+        prices = prepare_timeframe(parse_history(document["payload"]), args.timeframe, adjusted=not args.raw,
+                                   close_basis="close" if args.last_trade else "final", cache=cache, code=args.value,
+                                   session=session, intraday_days=args.intraday_days)
         if len(prices) < max(14, args.cci) + 2:
-            raise DataError("Insufficient completed trading days")
+            raise DataError("Insufficient completed candles for the selected timeframe")
         result = analyze(prices, StrategyConfig(args.cci))
         result["source"] = "TSETMC"
         result["instrument_code"] = args.value
         result["fetched_at_utc"] = document["fetched_at"]
         result["adjusted"] = not args.raw
-        result["close_basis"] = "close" if args.last_trade else "final"
+        result["close_basis"] = "close" if args.last_trade or args.timeframe == "2h" else "final"
+        result["timeframe"] = args.timeframe
+        result["timezone"] = "Asia/Tehran"
+        result["intraday_days"] = args.intraday_days
+        result["session_start"], result["session_end"] = session.start, session.end
+        result["include_short_bar"] = session.include_short
         result["cci_period"] = args.cci
         result["entry_rules"] = "A1,A2,B"
         result["include_today"] = False
-        output = args.output or (args.data_dir / f"{document['code']}_cci{args.cci}.csv")
+        suffix = "" if args.timeframe == "daily" else "_" + args.timeframe
+        output = args.output or (args.data_dir / f"{document['code']}_cci{args.cci}{suffix}.csv")
         output.parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(output, index=False, encoding="utf-8-sig")
         print(result[["date", "rsi", "cci", "action", "reason", "holding"]].tail(1).to_string(index=False))
