@@ -57,22 +57,40 @@ class ScanOptions:
             raise ValueError("تنظیمات دریافت معتبر نیست.")
 
 
+def _window_fields(events: list[dict], max_age: int) -> dict:
+    fields = {}
+    for prefix, predicate in (("entry", lambda e: bool(e["entry_conditions"])),
+                              ("buy", lambda e: e["action"] == "BUY"),
+                              ("exit", lambda e: e["action"] == "EXIT")):
+        selected = [event for event in events if 0 <= event["bars_ago"] <= max_age and predicate(event)]
+        event = min(selected, key=lambda e: e["bars_ago"]) if selected else None
+        fields[prefix + "_signal_date"] = event["date"] if event else ""
+        fields[prefix + "_bars_ago"] = event["bars_ago"] if event else None
+        for key in ("rsi", "cci", "close"):
+            fields[prefix + "_" + key] = event[key] if event else None
+        if prefix == "entry":
+            fields["entry_conditions"] = event["entry_conditions"] if event else ""
+        elif prefix == "exit":
+            fields["exit_reason"] = event["reason"] if event else ""
+        else:
+            fields["buy_conditions"] = event["reason"] if event else ""
+    return fields
+
+
 def summarize(result: pd.DataFrame, lookback: int, timeframe: str = "daily") -> dict:
     """Keep last-bar state separate from recent threshold events."""
-    last, recent = result.iloc[-1], result.tail(lookback)
-    entry = recent.loc[recent["entry_conditions"].ne("")]
-    buy = recent.loc[recent["action"].eq("BUY")]
-    exits = recent.loc[recent["action"].eq("EXIT")]
-
-    def event_date(events):
-        return label_timestamp(events.iloc[-1]["date"], timeframe) if not events.empty else ""
-
+    last = result.iloc[-1]
+    events = []
+    for index in range(max(0, len(result) - 10), len(result)):
+        bar = result.iloc[index]
+        if bar["entry_conditions"] or bar["action"]:
+            events.append({"date": label_timestamp(bar["date"], timeframe), "bars_ago": len(result) - 1 - index,
+                           "entry_conditions": str(bar["entry_conditions"]), "action": str(bar["action"]),
+                           "reason": str(bar["reason"]), "rsi": float(bar["rsi"]),
+                           "cci": float(bar["cci"]), "close": float(bar["close"])})
     return {"date": label_timestamp(last["date"], timeframe), "close": float(last["close"]),
             "rsi": float(last["rsi"]), "cci": float(last["cci"]),
-            "entry_signal_date": event_date(entry),
-            "entry_conditions": str(entry.iloc[-1]["entry_conditions"]) if not entry.empty else "",
-            "buy_signal_date": event_date(buy), "exit_signal_date": event_date(exits),
-            "exit_reason": str(exits.iloc[-1]["reason"]) if not exits.empty else "",
+            "recent_signals": events, **_window_fields(events, lookback - 1),
             "action": str(last["action"]), "holding": bool(last["holding"]),
             "reached_100": bool(last["reached_100"]),
             "bar_minutes": int(last["bar_minutes"]) if "bar_minutes" in last else None,
@@ -80,15 +98,30 @@ def summarize(result: pd.DataFrame, lookback: int, timeframe: str = "daily") -> 
             "last_trade_at": str(last.get("last_trade_at", last.get("last_trade_date", "")))}
 
 
-def report_frame(snapshot: dict) -> pd.DataFrame:
-    frame = pd.DataFrame(snapshot.get("rows", []))
+def report_frame(snapshot: dict, max_bars_ago: int | None = None) -> pd.DataFrame:
+    if max_bars_ago is not None and not 0 <= max_bars_ago <= 9:
+        raise ValueError("تعداد کندل قبل باید بین صفر و ۹ باشد.")
+    options = snapshot.get("options", {})
+    age = options.get("lookback", 1) - 1 if max_bars_ago is None else max_bars_ago
+    rows = []
+    for original in snapshot.get("rows", []):
+        row = dict(original)
+        history = isinstance(row.get("recent_signals"), list)
+        row["window_history_available"] = history
+        if history:
+            row.update(_window_fields(row["recent_signals"], age))
+        row.pop("recent_signals", None)
+        rows.append(row)
+    frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
-    options = snapshot.get("options", {})
     if "timeframe" not in frame:
         frame["timeframe"] = "daily"
     for key in ("adjusted", "close_basis", "include_today", "lookback", "scope", "mode"):
         frame[key] = options.get(key)
+    frame["scan_lookback"] = options.get("lookback", 1)
+    frame["lookback"] = age + 1
+    frame["max_previous_candles"] = age
     frame["entry_rules"] = ",".join(options.get("entries", []))
     frame["scan_started_at_utc"] = snapshot.get("started_at", "")
     frame["reference_date"] = frame["timeframe"].map(snapshot.get("reference_dates", {"daily": snapshot.get("reference_date", "")})).fillna("")
@@ -101,8 +134,9 @@ def report_frame(snapshot: dict) -> pd.DataFrame:
     return frame
 
 
-def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = False, timeframe: str | None = None) -> pd.DataFrame:
-    frame = report_frame(snapshot)
+def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = False, timeframe: str | None = None,
+                   max_bars_ago: int | None = None) -> pd.DataFrame:
+    frame = report_frame(snapshot, max_bars_ago)
     if frame.empty:
         return frame
     mask = frame["status"].eq("OK")
@@ -112,14 +146,30 @@ def filter_results(snapshot: dict, kind: str = "entry", include_stale: bool = Fa
         mask &= ~frame["stale"]
     if kind == "entry":
         mask &= frame["entry_conditions"].ne("")
+        prefix = "entry"
     elif kind == "buy":
         mask &= frame["buy_signal_date"].ne("")
+        prefix = "buy"
     elif kind == "exit":
         mask &= frame["exit_signal_date"].ne("")
+        prefix = "exit"
     elif kind == "holding":
         mask &= frame["holding"]
+        prefix = None
     elif kind != "all":
         raise ValueError("Unknown result filter")
+    else:
+        prefix = None
+    if prefix:
+        frame["signal_bars_ago"] = frame.get(prefix + "_bars_ago", pd.Series(index=frame.index, dtype=float))
+        frame["signal_date"] = frame[prefix + "_signal_date"]
+        frame["matched_conditions"] = frame.get({"entry": "entry_conditions", "buy": "buy_conditions", "exit": "exit_reason"}[prefix], "")
+        for key in ("rsi", "cci", "close"):
+            frame["signal_" + key] = frame.get(prefix + "_" + key, pd.Series(index=frame.index, dtype=float))
+        if max_bars_ago is not None:
+            mask &= frame["signal_bars_ago"].le(max_bars_ago) & frame["signal_bars_ago"].ge(0)
+    else:
+        frame["signal_bars_ago"], frame["signal_date"], frame["matched_conditions"] = None, "", ""
     return frame.loc[mask].sort_values(["symbol", "timeframe", "cci_period"]).reset_index(drop=True)
 
 

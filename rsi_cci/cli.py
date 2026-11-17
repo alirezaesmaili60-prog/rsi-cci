@@ -29,6 +29,7 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true", help="Scan cached universe and histories only")
     parser.add_argument("--refresh", action="store_true", help="Force refresh of all histories in scan")
     parser.add_argument("--lookback", type=int, default=1, help="Scan signals in last N bars (1..10)")
+    parser.add_argument("--previous-candles", type=int, choices=range(10), help="Include current bar and N previous bars (0..9)")
     parser.add_argument("--cache-minutes", type=int, default=60)
     parser.add_argument("--timeframe", choices=list(TIMEFRAMES), default="daily", help="Single-symbol or default scan timeframe")
     parser.add_argument("--timeframes", nargs="+", choices=list(TIMEFRAMES), help="Multiple scan timeframes")
@@ -50,7 +51,8 @@ def main() -> int:
             options = ScanOptions(periods=(14, 20) if args.both_cci else (args.cci,), scope=args.scope,
                                   mode="offline" if args.offline else "refresh" if args.refresh else "resume",
                                   adjusted=not args.raw, close_basis="close" if args.last_trade else "final",
-                                  lookback=args.lookback, cache_minutes=args.cache_minutes,
+                                  lookback=args.lookback if args.previous_candles is None else args.previous_candles + 1,
+                                  cache_minutes=args.cache_minutes,
                                   timeframes=tuple(args.timeframes or [args.timeframe]), intraday_days=args.intraday_days,
                                   session_start=session.start, session_end=session.end, include_short_bar=session.include_short)
             print("Collecting market universe and daily histories...", flush=True)

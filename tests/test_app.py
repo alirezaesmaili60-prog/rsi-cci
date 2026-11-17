@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,25 @@ APP = str(Path(__file__).resolve().parents[1] / "app.py")
 
 
 class AppTests(unittest.TestCase):
+    def test_recent_market_signals_can_be_filtered_from_saved_report_without_http(self):
+        from tests.test_recent_signals import recent_snapshot
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"RSI_CCI_DATA_DIR": temp}), \
+             patch("rsi_cci.tsetmc.TsetmcClient.history") as history, \
+             patch("rsi_cci.tsetmc.TsetmcClient.trades") as trades:
+            directory = Path(temp) / "market"
+            directory.mkdir()
+            (directory / "latest_scan.json").write_text(json.dumps(recent_snapshot()), encoding="utf8")
+            app = AppTest.from_file(APP, default_timeout=30).run()
+            next(field for field in app.selectbox if field.label == "نمایش تایم‌فریم نتیجه").select("weekly").run()
+            next(field for field in app.number_input if field.label == "نمایش شرط از کندل فعلی تا چند کندل قبل؟").set_value(3).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(len(app.dataframe[0].value), 3)
+            self.assertEqual(set(app.dataframe[0].value["کندل سیگنال"]), {"کندل فعلی", "2 کندل قبل", "3 کندل قبل"})
+            next(field for field in app.number_input if field.label == "نمایش شرط از کندل فعلی تا چند کندل قبل؟").set_value(2).run()
+            self.assertEqual(len(app.dataframe[0].value), 2)
+            history.assert_not_called()
+            trades.assert_not_called()
+
     def test_market_timeframe_filter_survives_full_rerun(self):
         from rsi_cci.market import ScanOptions
         from rsi_cci.market_ui import market_scanner

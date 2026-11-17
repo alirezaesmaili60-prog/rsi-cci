@@ -1,6 +1,7 @@
 """Persian local browser UI. Start with: python -m streamlit run app.py"""
 
 import os
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -234,6 +235,20 @@ def main():
                           timeframe=timeframe, intraday_days=intraday_days, session=session)
         except (DataError, ValueError) as exc:
             st.error(str(exc))
+        if timeframe == "2h" and not doc.get("demo"):
+            directory = CACHE.directory / "diagnostics" / str(doc["code"])
+            reports = sorted(directory.glob("*-trades.json"), key=lambda p: p.stat().st_mtime, reverse=True) if directory.exists() else []
+            if reports:
+                with st.expander("جزئیات آخرین خطای ریزمعاملات"):
+                    try:
+                        content = reports[0].read_bytes()
+                        report = json.loads(content)
+                        st.write(report.get("message", report.get("reason", "")))
+                        st.json(report)
+                        st.download_button("ذخیره گزارش خطای ریزمعاملات", content, reports[0].name,
+                                           "application/json", on_click="ignore")
+                    except (OSError, ValueError):
+                        st.caption("فایل گزارش قابل خواندن نیست.")
     else:
         st.info("برای نمودار و تاریخچه یک سهم، از تب دریافت تک‌سهم یا داده ذخیره‌شده استفاده کنید؛ شناسه نماد در نتایج بازار هم موجود است.")
     with st.expander("قواعد دقیق و محدودیت‌ها"):

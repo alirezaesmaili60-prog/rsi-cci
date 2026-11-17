@@ -12,6 +12,18 @@ from rsi_cci.demo import demo_history
 
 
 class CliTests(unittest.TestCase):
+    def test_previous_candles_option_includes_current_plus_three_previous(self):
+        from tests.market_fixtures import market_item, signal_history
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()), \
+             patch("rsi_cci.tsetmc.TsetmcClient.market_universe", return_value=[market_item("1")]), \
+             patch("rsi_cci.tsetmc.TsetmcClient.history", return_value=signal_history()), \
+             patch("sys.argv", ["cli", "scan", "--data-dir", temp, "--previous-candles", "3"]):
+            self.assertEqual(main(), 0)
+            frame = pd.read_csv(Path(temp) / "market/latest_scan_matches.csv")
+            self.assertEqual(set(frame["lookback"]), {4})
+            self.assertEqual(set(frame["max_previous_candles"]), {3})
+            self.assertTrue(frame["signal_bars_ago"].le(3).all())
+
     def test_weekly_analysis_uses_cached_daily_data(self):
         from rsi_cci.data import HistoryCache
         from tests.market_fixtures import signal_history
